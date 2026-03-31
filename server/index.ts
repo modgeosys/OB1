@@ -8,42 +8,38 @@ import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
+const OLLAMA_BASE = Deno.env.get("OLLAMA_BASE") || "http://localhost:11434";
+const OLLAMA_EMBED_MODEL = Deno.env.get("OLLAMA_EMBED_MODEL") || "mxbai-embed-large";
+const OLLAMA_CHAT_MODEL = Deno.env.get("OLLAMA_CHAT_MODEL") || "gpt-oss-20b";
 
-const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+  const r = await fetch(`${OLLAMA_BASE}/api/embed`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
+      model: OLLAMA_EMBED_MODEL,
       input: text,
     }),
   });
   if (!r.ok) {
     const msg = await r.text().catch(() => "");
-    throw new Error(`OpenRouter embeddings failed: ${r.status} ${msg}`);
+    throw new Error(`Ollama embeddings failed: ${r.status} ${msg}`);
   }
   const d = await r.json();
-  return d.data[0].embedding;
+  return d.embeddings[0];
 }
 
 async function extractMetadata(text: string): Promise<Record<string, unknown>> {
-  const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+  const r = await fetch(`${OLLAMA_BASE}/api/chat`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
-      response_format: { type: "json_object" },
+      model: OLLAMA_CHAT_MODEL,
+      format: "json",
+      stream: false,
       messages: [
         {
           role: "system",
@@ -61,7 +57,7 @@ Only extract what's explicitly there.`,
   });
   const d = await r.json();
   try {
-    return JSON.parse(d.choices[0].message.content);
+    return JSON.parse(d.message.content);
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
