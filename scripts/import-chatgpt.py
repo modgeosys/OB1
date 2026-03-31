@@ -17,7 +17,16 @@ import requests
 
 OLLAMA_BASE = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3.5:35b"
-OPEN_BRAIN_URL = "http://localhost:8000/functions/v1/open-brain"
+ORGS = {
+    "personal": {
+        "url": "http://localhost:8000/functions/v1/open-brain-personal",
+        "key_env": "OPEN_BRAIN_KEY_PERSONAL",
+    },
+    "ic": {
+        "url": "http://localhost:8000/functions/v1/open-brain-ic",
+        "key_env": "OPEN_BRAIN_KEY_IC",
+    },
+}
 MIN_MESSAGES = 3
 MAX_TRANSCRIPT_CHARS = 12000  # Keep within model context window
 
@@ -131,11 +140,11 @@ def extract_knowledge(transcript: str) -> list[str]:
         return []
 
 
-def capture_thought(content: str, access_key: str) -> bool:
+def capture_thought(content: str, access_key: str, org_url: str) -> bool:
     """Save a thought to Open Brain via MCP JSON-RPC."""
     try:
         r = requests.post(
-            f"{OPEN_BRAIN_URL}?key={access_key}",
+            f"{org_url}?key={access_key}",
             json={
                 "jsonrpc": "2.0",
                 "method": "tools/call",
@@ -180,15 +189,20 @@ def review_item(item: str, index: int, total: int) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Import ChatGPT conversations into Open Brain")
     parser.add_argument("file", type=Path, help="Path to conversations.json")
+    parser.add_argument("--org", choices=list(ORGS.keys()), default="personal", help="Target organization (default: personal)")
     parser.add_argument("--dry-run", action="store_true", help="Preview extractions without saving")
     parser.add_argument("--auto", action="store_true", help="Save all items without interactive review")
-    parser.add_argument("--key", default=os.environ.get("OPEN_BRAIN_KEY"), help="Open Brain MCP access key (default: $OPEN_BRAIN_KEY)")
+    parser.add_argument("--key", help="Open Brain MCP access key (default: $OPEN_BRAIN_KEY_<ORG>)")
     parser.add_argument("--ollama-model", default=OLLAMA_MODEL, help=f"Ollama model for extraction (default: {OLLAMA_MODEL})")
     parser.add_argument("--min-messages", type=int, default=MIN_MESSAGES, help=f"Skip conversations with fewer messages (default: {MIN_MESSAGES})")
     args = parser.parse_args()
 
-    if not args.key:
-        print("Error: No access key provided. Use --key or set OPEN_BRAIN_KEY env var.", file=sys.stderr)
+    org_config = ORGS[args.org]
+    org_url = org_config["url"]
+    access_key = args.key or os.environ.get(org_config["key_env"])
+
+    if not access_key:
+        print(f"Error: No access key provided. Use --key or set {org_config['key_env']} env var.", file=sys.stderr)
         sys.exit(1)
 
     if not args.file.exists():
@@ -197,7 +211,7 @@ def main():
 
     print(f"Loading {args.file}...")
     conversations = parse_conversations(args.file)
-    print(f"Found {len(conversations)} conversations")
+    print(f"Found {len(conversations)} conversations (target: {args.org})")
 
     # Sort by create_time if available
     conversations.sort(key=lambda c: c.get("create_time", 0))
@@ -262,7 +276,7 @@ def main():
                         continue
                     item = edited
 
-            if capture_thought(item, args.key):
+            if capture_thought(item, access_key, org_url):
                 total_saved += 1
                 print(f"  ✓ Saved")
             else:
