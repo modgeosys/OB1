@@ -3,11 +3,14 @@
 
 Usage:
     python import-chatgpt.py /path/to/conversations.json
+    python import-chatgpt.py /path/to/conversations-000.json conversations-001.json
+    python import-chatgpt.py '/path/to/conversations-*.json'
     python import-chatgpt.py /path/to/conversations.json --dry-run
     python import-chatgpt.py /path/to/conversations.json --auto
 """
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -188,7 +191,7 @@ def review_item(item: str, index: int, total: int) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Import ChatGPT conversations into Open Brain")
-    parser.add_argument("file", type=Path, help="Path to conversations.json")
+    parser.add_argument("files", nargs="+", help="Path(s) to conversations.json files (glob patterns supported)")
     parser.add_argument("--org", choices=list(ORGS.keys()), default="personal", help="Target organization (default: personal)")
     parser.add_argument("--dry-run", action="store_true", help="Preview extractions without saving")
     parser.add_argument("--auto", action="store_true", help="Save all items without interactive review")
@@ -205,13 +208,31 @@ def main():
         print(f"Error: No access key provided. Use --key or set {org_config['key_env']} env var.", file=sys.stderr)
         sys.exit(1)
 
-    if not args.file.exists():
-        print(f"Error: {args.file} not found", file=sys.stderr)
+    # Resolve glob patterns and collect unique file paths
+    resolved_paths: list[Path] = []
+    for pattern in args.files:
+        if any(c in pattern for c in ("*", "?", "[")):
+            expanded = sorted(glob.glob(pattern))
+            if not expanded:
+                print(f"Warning: no files matched pattern '{pattern}'", file=sys.stderr)
+            resolved_paths.extend(Path(p) for p in expanded)
+        else:
+            resolved_paths.append(Path(pattern))
+
+    if not resolved_paths:
+        print("Error: no input files found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loading {args.file}...")
-    conversations = parse_conversations(args.file)
-    print(f"Found {len(conversations)} conversations (target: {args.org})")
+    # Load and aggregate conversations from all files
+    conversations: list[dict] = []
+    for path in resolved_paths:
+        if not path.exists():
+            print(f"Error: {path} not found", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loading {path}...")
+        conversations.extend(parse_conversations(path))
+
+    print(f"Loaded {len(resolved_paths)} file(s), {len(conversations)} conversations (target: {args.org})")
 
     # Sort by create_time if available
     conversations.sort(key=lambda c: c.get("create_time", 0))
