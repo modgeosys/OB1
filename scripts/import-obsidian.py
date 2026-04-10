@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -35,7 +36,7 @@ MAX_TRANSCRIPT_CHARS = 12000  # Keep within model context window
 DEFAULT_EXCLUDES = {".obsidian", ".trash", "templates", ".git"}
 FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n?", re.DOTALL)
 
-EXTRACTION_PROMPT = """Analyze this personal note from the user's knowledge base. Extract ONLY persistent knowledge — facts, preferences, decisions, relationships, and context that would be useful for a different AI to know about this user in the future.
+EXTRACTION_PROMPT_PERSONAL = """Analyze this personal note from the user's knowledge base. Extract ONLY persistent knowledge — facts, preferences, decisions, relationships, and context that would be useful for a different AI to know about this user in the future.
 
 Ignore: boilerplate, templates, empty scaffolding, task lists with no context, generic reference material copied from elsewhere.
 Keep: personal details, professional context, preferences, recurring themes, important decisions, people mentioned with context, project details, organizational affiliations.
@@ -47,6 +48,20 @@ Example output:
   "User works as a data scientist at Acme Corp",
   "User prefers Python over JavaScript for backend work",
   "User is building a personal knowledge management system using Obsidian"
+]"""
+
+EXTRACTION_PROMPT_ORG = """Analyze this note from an organization's knowledge base. Extract ONLY persistent knowledge about the organization — facts, decisions, strategy, processes, contacts, and context that would be useful for a different AI working with this organization in the future.
+
+Ignore: boilerplate, templates, empty scaffolding, task lists with no context, generic reference material copied from elsewhere.
+Keep: organizational strategy and decisions, key people and their roles, processes and workflows, project status and goals, partnerships, policies, institutional knowledge, and the user's organization-related preferences and working style.
+
+Return a JSON array of standalone statements. Each statement should make sense on its own to someone with no context. Return an empty array [] if nothing persistent is found.
+
+Example output:
+[
+  "The organization uses a two-week sprint cycle with Monday standups",
+  "Sarah Chen is the lead designer responsible for the mobile app redesign",
+  "The board approved a pivot to B2B sales in Q1 2026"
 ]"""
 
 
@@ -96,7 +111,7 @@ def build_transcript(note: dict) -> str | None:
     return transcript
 
 
-def extract_knowledge(transcript: str) -> list[str]:
+def extract_knowledge(transcript: str, prompt: str) -> list[str]:
     """Send transcript to Ollama and extract persistent knowledge items."""
     try:
         r = requests.post(
@@ -106,7 +121,7 @@ def extract_knowledge(transcript: str) -> list[str]:
                 "format": "json",
                 "stream": False,
                 "messages": [
-                    {"role": "system", "content": EXTRACTION_PROMPT},
+                    {"role": "system", "content": prompt},
                     {"role": "user", "content": transcript},
                 ],
             },
@@ -130,40 +145,46 @@ def extract_knowledge(transcript: str) -> list[str]:
         return []
 
 
-def capture_thought(content: str, access_key: str, org_url: str) -> bool:
-    """Save a thought to Open Brain via MCP JSON-RPC."""
-    try:
-        r = requests.post(
-            f"{org_url}?key={access_key}",
-            json={
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": {
-                    "name": "capture_thought",
-                    "arguments": {"content": content},
+def capture_thought(content: str, access_key: str, org_url: str, max_retries: int = 3) -> bool:
+    """Save a thought to Open Brain via MCP JSON-RPC. Retries on transient errors."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+                f"{org_url}?key={access_key}",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "capture_thought",
+                        "arguments": {"content": content},
+                    },
+                    "id": 1,
                 },
-                "id": 1,
-            },
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-            },
-            timeout=120,
-        )
-        r.raise_for_status()
-        # Parse SSE response
-        for line in r.text.splitlines():
-            if line.startswith("data: "):
-                data = json.loads(line[6:])
-                if data.get("result", {}).get("isError"):
-                    error_text = data["result"]["content"][0]["text"]
-                    print(f"  ⚠ Capture error: {error_text}", file=sys.stderr)
-                    return False
-                return True
-        return False
-    except requests.RequestException as e:
-        print(f"  ⚠ Network error: {e}", file=sys.stderr)
-        return False
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
+                timeout=120,
+            )
+            r.raise_for_status()
+            # Parse SSE response
+            for line in r.text.splitlines():
+                if line.startswith("data: "):
+                    data = json.loads(line[6:])
+                    if data.get("result", {}).get("isError"):
+                        error_text = data["result"]["content"][0]["text"]
+                        print(f"  ⚠ Capture error: {error_text}", file=sys.stderr)
+                        return False
+                    return True
+            return False
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt
+                print(f"  ⚠ Network error (retry {attempt + 1}/{max_retries} in {delay}s): {e}", file=sys.stderr)
+                time.sleep(delay)
+            else:
+                print(f"  ⚠ Network error (giving up after {max_retries} attempts): {e}", file=sys.stderr)
+                return False
 
 
 def review_item(item: str, index: int, total: int) -> str:
@@ -177,6 +198,7 @@ def review_item(item: str, index: int, total: int) -> str:
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Import Obsidian vault notes into Open Brain")
     parser.add_argument("dirs", nargs="+", help="Path(s) to Obsidian vault directories")
     parser.add_argument("--org", choices=list(ORGS.keys()), default="personal", help="Target organization (default: personal)")
@@ -191,6 +213,7 @@ def main():
     org_config = ORGS[args.org]
     org_url = org_config["url"]
     access_key = args.key or os.environ.get(org_config["key_env"])
+    extraction_prompt = EXTRACTION_PROMPT_PERSONAL if args.org == "personal" else EXTRACTION_PROMPT_ORG
 
     if not access_key:
         print(f"Error: No access key provided. Use --key or set {org_config['key_env']} env var.", file=sys.stderr)
@@ -232,7 +255,7 @@ def main():
         print(f"\n[{i + 1}/{len(all_notes)}] {note['path']}")
         print(f"  Extracting knowledge...")
 
-        items = extract_knowledge(transcript)
+        items = extract_knowledge(transcript, extraction_prompt)
 
         if not items:
             total_skipped_empty += 1
