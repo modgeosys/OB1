@@ -1,0 +1,13 @@
+{
+  "name": "capture-thought",
+  "description": "Capture thoughts to Open Brain with automatic organization routing based on project context.",
+  "category": "skills",
+  "author": { "name": "Kevin Weller", "github": "modgeosys" },
+  "version": "1.0.0",
+  "requires": { "open_brain": true, "services": ["mcp"], "tools": ["capture_thought"] },
+  "tags": ["skill", "thought-capture", "routing", "mcp"],
+  "difficulty": "beginner",
+  "estimated_time": "5 minutes",
+  "created": "2026-04-12",
+  "updated": "2026-04-12"
+}
