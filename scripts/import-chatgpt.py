@@ -124,13 +124,13 @@ def build_transcript(conversation: dict) -> str | None:
     return transcript
 
 
-def extract_knowledge(transcript: str, prompt: str) -> list[str]:
+def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL) -> list[str]:
     """Send transcript to Ollama and extract persistent knowledge items."""
     try:
         r = requests.post(
             f"{OLLAMA_BASE}/api/chat",
             json={
-                "model": OLLAMA_MODEL,
+                "model": model,
                 "format": "json",
                 "stream": False,
                 "messages": [
@@ -280,7 +280,7 @@ def main():
         print(f"\n[{i + 1}/{len(conversations)}] {title}")
         print(f"  Extracting knowledge...")
 
-        items = extract_knowledge(transcript, extraction_prompt)
+        items = extract_knowledge(transcript, extraction_prompt, args.ollama_model)
 
         if not items:
             total_skipped_empty += 1

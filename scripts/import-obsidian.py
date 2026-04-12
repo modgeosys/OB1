@@ -21,6 +21,7 @@ import requests
 
 OLLAMA_BASE = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3.5:35b"
+OLLAMA_TIMEOUT = 900  # seconds; large models with CPU offload can be slow
 ORGS = {
     "personal": {
         "url": "http://localhost:8000/functions/v1/open-brain-personal",
@@ -53,7 +54,7 @@ Example output:
 EXTRACTION_PROMPT_ORG = """Analyze this note from an organization's knowledge base. Extract ONLY persistent knowledge about the organization — facts, decisions, strategy, processes, contacts, and context that would be useful for a different AI working with this organization in the future.
 
 Ignore: boilerplate, templates, empty scaffolding, task lists with no context, generic reference material copied from elsewhere.
-Keep: organizational strategy and decisions, key people and their roles, processes and workflows, project status and goals, partnerships, policies, institutional knowledge, and the user's organization-related preferences and working style.
+Keep: the organization's vision, mission, philosophy, strategy, methods, and basic factual knowledge; decisions; key people and their roles; processes and workflows; project status and goals; partnerships; policies; institutional knowledge; and the user's organization-related preferences and working style.
 
 Return a JSON array of standalone statements. Each statement should make sense on its own to someone with no context. Return an empty array [] if nothing persistent is found.
 
@@ -63,6 +64,26 @@ Example output:
   "Sarah Chen is the lead designer responsible for the mobile app redesign",
   "The board approved a pivot to B2B sales in Q1 2026"
 ]"""
+
+
+def load_single_note(filepath: Path, min_chars: int) -> dict | None:
+    """Load a single .md file as a note dict. Returns None if unreadable or too short."""
+    try:
+        raw = filepath.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        print(f"  Warning: {filepath} is not UTF-8", file=sys.stderr)
+        return None
+
+    body = FRONTMATTER_RE.sub("", raw, count=1).strip()
+    if len(body) < min_chars:
+        print(f"  Warning: {filepath} body is {len(body)} chars, below --min-chars {min_chars}", file=sys.stderr)
+        return None
+
+    return {
+        "title": filepath.stem,
+        "body": body,
+        "path": str(filepath),
+    }
 
 
 def discover_notes(vault_root: Path, excludes: set[str], min_chars: int) -> list[dict]:
@@ -101,48 +122,121 @@ def discover_notes(vault_root: Path, excludes: set[str], min_chars: int) -> list
     return notes
 
 
-def build_transcript(note: dict) -> str | None:
-    """Format a note for knowledge extraction."""
-    transcript = f"Note: {note['title']}\n\n{note['body']}"
+def build_chunks(note: dict, max_chars: int = MAX_TRANSCRIPT_CHARS) -> list[str]:
+    """Split a note into transcript chunks that fit the model context window.
 
-    if len(transcript) > MAX_TRANSCRIPT_CHARS:
-        transcript = transcript[:MAX_TRANSCRIPT_CHARS] + "\n\n[... truncated]"
+    Splits at paragraph boundaries (double newlines), then single newlines, then
+    hard-splits as a last resort. Each chunk is prefixed with the note title so
+    the model always has context about what it's reading.
+    """
+    title = note["title"]
+    body = note["body"]
 
-    return transcript
+    # Reserve space for the header and a small safety margin
+    header_template = f"Note: {title} (part {{n}}/{{total}})\n\n"
+    single_header = f"Note: {title}\n\n"
+    budget = max_chars - len(header_template.format(n=99, total=99)) - 100
+
+    # Fast path: whole note fits in one chunk
+    if len(body) <= max_chars - len(single_header) - 100:
+        return [single_header + body]
+
+    # Split into paragraphs and pack them into chunks
+    paragraphs = body.split("\n\n")
+    raw_chunks: list[str] = []
+    current = ""
+
+    def flush():
+        nonlocal current
+        if current.strip():
+            raw_chunks.append(current.strip())
+        current = ""
+
+    for para in paragraphs:
+        # If a single paragraph exceeds budget, try splitting on single newlines
+        if len(para) > budget:
+            flush()
+            lines = para.split("\n")
+            sub = ""
+            for line in lines:
+                if len(sub) + len(line) + 1 > budget:
+                    if sub.strip():
+                        raw_chunks.append(sub.strip())
+                    sub = ""
+                    # Still too big? Hard-split.
+                    if len(line) > budget:
+                        for i in range(0, len(line), budget):
+                            raw_chunks.append(line[i:i + budget])
+                        continue
+                sub += line + "\n"
+            if sub.strip():
+                raw_chunks.append(sub.strip())
+            continue
+
+        if len(current) + len(para) + 2 > budget:
+            flush()
+        current += para + "\n\n"
+
+    flush()
+
+    # Prepend headers with part numbers
+    total = len(raw_chunks)
+    return [f"Note: {title} (part {n + 1}/{total})\n\n{c}" for n, c in enumerate(raw_chunks)]
 
 
-def extract_knowledge(transcript: str, prompt: str) -> list[str]:
-    """Send transcript to Ollama and extract persistent knowledge items."""
-    try:
-        r = requests.post(
-            f"{OLLAMA_BASE}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "format": "json",
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": transcript},
-                ],
-            },
-            timeout=300,
-        )
-        r.raise_for_status()
-        content = r.json()["message"]["content"]
-        parsed = json.loads(content)
+def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL, timeout: int = OLLAMA_TIMEOUT, max_retries: int = 3) -> list[str]:
+    """Send transcript to Ollama and extract persistent knowledge items.
 
-        # Handle both array and object-with-array responses
-        if isinstance(parsed, list):
-            return [str(item) for item in parsed if item]
-        if isinstance(parsed, dict):
-            # Some models wrap the array in a key
-            for value in parsed.values():
-                if isinstance(value, list):
-                    return [str(item) for item in value if item]
-        return []
-    except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
-        print(f"  ⚠ Extraction error: {e}", file=sys.stderr)
-        return []
+    Retries on network errors (exponential backoff) and on malformed JSON from
+    the model (immediate retry — re-sampling usually produces valid JSON).
+    """
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+                f"{OLLAMA_BASE}/api/chat",
+                json={
+                    "model": model,
+                    "format": "json",
+                    "stream": False,
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": transcript},
+                    ],
+                },
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            content = r.json()["message"]["content"]
+            parsed = json.loads(content)
+
+            # Handle both array and object-with-array responses
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if item]
+            if isinstance(parsed, dict):
+                # Some models wrap the array in a key
+                for value in parsed.values():
+                    if isinstance(value, list):
+                        return [str(item) for item in value if item]
+            return []
+        except json.JSONDecodeError as e:
+            if attempt < max_retries - 1:
+                print(f"  ⚠ Malformed JSON from model (retry {attempt + 1}/{max_retries}): {e}", file=sys.stderr)
+            else:
+                print(f"  ⚠ Extraction error (giving up after {max_retries} attempts): {e}", file=sys.stderr)
+                return []
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt
+                print(f"  ⚠ Network error (retry {attempt + 1}/{max_retries} in {delay}s): {e}", file=sys.stderr)
+                time.sleep(delay)
+            else:
+                print(f"  ⚠ Extraction error (giving up after {max_retries} attempts): {e}", file=sys.stderr)
+                return []
+        except KeyError as e:
+            print(f"  ⚠ Unexpected response shape from model: {e}", file=sys.stderr)
+            return []
+
+    return []
 
 
 def capture_thought(content: str, access_key: str, org_url: str, max_retries: int = 3) -> bool:
@@ -200,12 +294,13 @@ def review_item(item: str, index: int, total: int) -> str:
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Import Obsidian vault notes into Open Brain")
-    parser.add_argument("dirs", nargs="+", help="Path(s) to Obsidian vault directories")
+    parser.add_argument("paths", nargs="+", help="Path(s) to Obsidian vault directories or individual .md files")
     parser.add_argument("--org", choices=list(ORGS.keys()), default="personal", help="Target organization (default: personal)")
     parser.add_argument("--dry-run", action="store_true", help="Preview extractions without saving")
     parser.add_argument("--auto", action="store_true", help="Save all items without interactive review")
     parser.add_argument("--key", help="Open Brain MCP access key (default: $OPEN_BRAIN_KEY_<ORG>)")
     parser.add_argument("--ollama-model", default=OLLAMA_MODEL, help=f"Ollama model for extraction (default: {OLLAMA_MODEL})")
+    parser.add_argument("--ollama-timeout", type=int, default=OLLAMA_TIMEOUT, help=f"Ollama request timeout in seconds (default: {OLLAMA_TIMEOUT})")
     parser.add_argument("--min-chars", type=int, default=MIN_CHARS, help=f"Skip notes shorter than N chars (default: {MIN_CHARS})")
     parser.add_argument("--exclude", nargs="*", default=[], help="Additional directory names to skip")
     args = parser.parse_args()
@@ -221,16 +316,26 @@ def main():
 
     excludes = DEFAULT_EXCLUDES | set(args.exclude)
 
-    # Discover notes from all vault directories
+    # Discover notes from vault directories and/or individual files
     all_notes: list[dict] = []
-    for dir_path in args.dirs:
-        root = Path(dir_path)
-        if not root.is_dir():
-            print(f"Error: {root} is not a directory", file=sys.stderr)
+    for input_path in args.paths:
+        p = Path(input_path)
+        if p.is_dir():
+            notes = discover_notes(p, excludes, args.min_chars)
+            print(f"Found {len(notes)} notes in {p}")
+            all_notes.extend(notes)
+        elif p.is_file():
+            if p.suffix.lower() != ".md":
+                print(f"Error: {p} is not a .md file", file=sys.stderr)
+                sys.exit(1)
+            note = load_single_note(p, args.min_chars)
+            if note is None:
+                sys.exit(1)
+            print(f"Loaded single file: {p}")
+            all_notes.append(note)
+        else:
+            print(f"Error: {p} is not a directory or file", file=sys.stderr)
             sys.exit(1)
-        notes = discover_notes(root, excludes, args.min_chars)
-        print(f"Found {len(notes)} notes in {root}")
-        all_notes.extend(notes)
 
     if not all_notes:
         print("No notes found matching criteria.")
@@ -247,15 +352,25 @@ def main():
         if quit_requested:
             break
 
-        transcript = build_transcript(note)
-
-        if transcript is None:
-            continue
+        chunks = build_chunks(note)
 
         print(f"\n[{i + 1}/{len(all_notes)}] {note['path']}")
-        print(f"  Extracting knowledge...")
+        if len(chunks) > 1:
+            print(f"  Note is large ({len(note['body'])} chars) — splitting into {len(chunks)} chunks")
 
-        items = extract_knowledge(transcript, extraction_prompt)
+        items: list[str] = []
+        seen: set[str] = set()
+        for chunk_idx, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                print(f"  Extracting knowledge (chunk {chunk_idx + 1}/{len(chunks)})...")
+            else:
+                print(f"  Extracting knowledge...")
+            chunk_items = extract_knowledge(chunk, extraction_prompt, args.ollama_model, args.ollama_timeout)
+            for item in chunk_items:
+                key = item.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    items.append(item)
 
         if not items:
             total_skipped_empty += 1
@@ -277,7 +392,7 @@ def main():
                 break
 
             if accept_all:
-                print(f"  Saving: {item[:80]}{'...' if len(item) > 80 else ''}")
+                print(f"  Saving: {item}")
             else:
                 action = review_item(item, j, len(items))
 

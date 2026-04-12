@@ -346,6 +346,117 @@ server.registerTool(
   }
 );
 
+// Tool 5: Re-embed Pending
+server.registerTool(
+  "reembed_pending",
+  {
+    title: "Re-embed Pending Thoughts",
+    description:
+      "Find thoughts with NULL embeddings (edited or never embedded) and regenerate them. Processes up to `batch_size` rows per call. Returns counts so a client can loop until drained.",
+    inputSchema: {
+      batch_size: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .default(50)
+        .describe("Max rows to process in this call"),
+      dry_run: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, report counts without writing"),
+    },
+  },
+  async ({ batch_size, dry_run }) => {
+    try {
+      const { count: remainingBefore, error: countErr } = await supabase
+        .from("thoughts")
+        .select("*", { count: "exact", head: true })
+        .is("embedding", null);
+
+      if (countErr) {
+        return {
+          content: [{ type: "text" as const, text: `Count error: ${countErr.message}` }],
+          isError: true,
+        };
+      }
+
+      if (dry_run) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                processed: 0,
+                failed: [],
+                remaining: remainingBefore ?? 0,
+                dry_run: true,
+              }),
+            },
+          ],
+        };
+      }
+
+      const { data: rows, error: selectErr } = await supabase
+        .from("thoughts")
+        .select("id, content")
+        .is("embedding", null)
+        .order("id", { ascending: true })
+        .limit(batch_size);
+
+      if (selectErr) {
+        return {
+          content: [{ type: "text" as const, text: `Select error: ${selectErr.message}` }],
+          isError: true,
+        };
+      }
+
+      let processed = 0;
+      const failed: { id: number; error: string }[] = [];
+
+      for (const row of rows || []) {
+        try {
+          const embedding = await getEmbedding(row.content);
+          const { error: updateErr } = await supabase
+            .from("thoughts")
+            .update({ embedding })
+            .eq("id", row.id);
+          if (updateErr) {
+            failed.push({ id: row.id, error: updateErr.message });
+          } else {
+            processed++;
+          }
+        } catch (err: unknown) {
+          failed.push({ id: row.id, error: (err as Error).message });
+        }
+      }
+
+      const remaining = Math.max(0, (remainingBefore ?? 0) - processed);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              processed,
+              failed,
+              remaining,
+              dry_run: false,
+            }),
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // --- Hono App with Auth + CORS ---
 
 const corsHeaders = {
