@@ -81,9 +81,14 @@ server.registerTool(
       query: z.string().describe("What to search for"),
       limit: z.number().optional().default(10),
       threshold: z.number().optional().default(0.5),
+      include_flagged: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, include thoughts flagged for removal"),
     },
   },
-  async ({ query, limit, threshold }) => {
+  async ({ query, limit, threshold, include_flagged }) => {
     try {
       const qEmb = await getEmbedding(query);
       const { data, error } = await supabase.rpc("match_thoughts", {
@@ -91,6 +96,7 @@ server.registerTool(
         match_threshold: threshold,
         match_count: limit,
         filter: {},
+        include_flagged,
       });
 
       if (error) {
@@ -109,6 +115,7 @@ server.registerTool(
       const results = data.map(
         (
           t: {
+            id: string;
             content: string;
             metadata: Record<string, unknown>;
             similarity: number;
@@ -118,7 +125,7 @@ server.registerTool(
         ) => {
           const m = t.metadata || {};
           const parts = [
-            `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
+            `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) id=${t.id} ---`,
             `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
             `Type: ${m.type || "unknown"}`,
           ];
@@ -163,16 +170,22 @@ server.registerTool(
       topic: z.string().optional().describe("Filter by topic tag"),
       person: z.string().optional().describe("Filter by person mentioned"),
       days: z.number().optional().describe("Only thoughts from the last N days"),
+      include_flagged: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, include thoughts flagged for removal"),
     },
   },
-  async ({ limit, type, topic, person, days }) => {
+  async ({ limit, type, topic, person, days, include_flagged }) => {
     try {
       let q = supabase
         .from("thoughts")
-        .select("content, metadata, created_at")
+        .select("id, content, metadata, created_at, to_be_deleted")
         .order("created_at", { ascending: false })
         .limit(limit);
 
+      if (!include_flagged) q = q.eq("to_be_deleted", false);
       if (type) q = q.contains("metadata", { type });
       if (topic) q = q.contains("metadata", { topics: [topic] });
       if (person) q = q.contains("metadata", { people: [person] });
@@ -197,12 +210,19 @@ server.registerTool(
 
       const results = data.map(
         (
-          t: { content: string; metadata: Record<string, unknown>; created_at: string },
+          t: {
+            id: string;
+            content: string;
+            metadata: Record<string, unknown>;
+            created_at: string;
+            to_be_deleted: boolean;
+          },
           i: number
         ) => {
           const m = t.metadata || {};
           const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+          const flagMark = t.to_be_deleted ? " [FLAGGED]" : "";
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] id=${t.id}${flagMark} (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
         }
       );
 
@@ -374,7 +394,8 @@ server.registerTool(
       const { count: remainingBefore, error: countErr } = await supabase
         .from("thoughts")
         .select("*", { count: "exact", head: true })
-        .is("embedding", null);
+        .is("embedding", null)
+        .eq("to_be_deleted", false);
 
       if (countErr) {
         return {
@@ -403,6 +424,7 @@ server.registerTool(
         .from("thoughts")
         .select("id, content")
         .is("embedding", null)
+        .eq("to_be_deleted", false)
         .order("id", { ascending: true })
         .limit(batch_size);
 
@@ -444,6 +466,179 @@ server.registerTool(
               failed,
               remaining,
               dry_run: false,
+            }),
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 6: Update Thought
+server.registerTool(
+  "update_thought",
+  {
+    title: "Update Thought",
+    description:
+      "Edit the content of an existing thought and re-embed it atomically. Use this when the user wants to revise or correct a previously captured thought without losing its id, metadata, or creation timestamp.",
+    inputSchema: {
+      id: z.string().describe("UUID of the thought to update"),
+      content: z.string().describe("New content for the thought"),
+    },
+  },
+  async ({ id, content }) => {
+    try {
+      const embedding = await getEmbedding(content);
+
+      const { data, error } = await supabase
+        .from("thoughts")
+        .update({ content, embedding })
+        .eq("id", id)
+        .select("id");
+
+      if (error) {
+        return {
+          content: [{ type: "text" as const, text: `Update error: ${error.message}` }],
+          isError: true,
+        };
+      }
+      if (!data || data.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `No thought found with id ${id}` }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: `Updated thought ${id} (re-embedded ${content.length} chars).` },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 7: Flag Thought for Removal
+server.registerTool(
+  "flag_thought_for_removal",
+  {
+    title: "Flag Thought for Removal",
+    description:
+      "Mark or unmark a thought as flagged for removal. Flagged thoughts are excluded from search and list results by default but remain in the database until the user manually deletes them.",
+    inputSchema: {
+      id: z.string().describe("UUID of the thought to flag"),
+      flagged: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("Set to false to unflag a previously-flagged thought"),
+    },
+  },
+  async ({ id, flagged }) => {
+    try {
+      const { data, error } = await supabase
+        .from("thoughts")
+        .update({ to_be_deleted: flagged })
+        .eq("id", id)
+        .select("id");
+
+      if (error) {
+        return {
+          content: [{ type: "text" as const, text: `Update error: ${error.message}` }],
+          isError: true,
+        };
+      }
+      if (!data || data.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `No thought found with id ${id}` }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: flagged ? `Flagged thought ${id} for removal.` : `Unflagged thought ${id}.`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 8: Find All Conflicts (corpus-wide)
+server.registerTool(
+  "find_all_conflicts",
+  {
+    title: "Find All Conflicts",
+    description:
+      "Scan the entire thoughts corpus for pairs of thoughts whose semantic similarity is at or above the given threshold. Returns canonical pairs (each pair appears once) ordered by similarity descending. Use this to surface near-duplicates and likely contradictions for interactive review.",
+    inputSchema: {
+      threshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .default(0.75)
+        .describe("Cosine similarity threshold (0-1). Higher = stricter."),
+      include_flagged: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, include pairs where either thought is flagged for removal"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(10000)
+        .optional()
+        .default(1000)
+        .describe("Max pairs to return (truncated from the top of the similarity-ordered list)"),
+    },
+  },
+  async ({ threshold, include_flagged, limit }) => {
+    try {
+      const { data, error } = await supabase.rpc("find_conflicts", {
+        similarity_threshold: threshold,
+        include_flagged,
+      });
+
+      if (error) {
+        return {
+          content: [{ type: "text" as const, text: `RPC error: ${error.message}` }],
+          isError: true,
+        };
+      }
+
+      const allPairs = (data || []) as Array<Record<string, unknown>>;
+      const returned = allPairs.slice(0, limit);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              total_pairs: allPairs.length,
+              returned: returned.length,
+              threshold,
+              include_flagged,
+              pairs: returned,
             }),
           },
         ],
