@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -239,8 +240,11 @@ def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL, t
     return []
 
 
-def capture_thought(content: str, access_key: str, org_url: str, max_retries: int = 3) -> bool:
+def capture_thought(content: str, access_key: str, org_url: str, sources: list[dict] | None = None, max_retries: int = 3) -> bool:
     """Save a thought to Open Brain via MCP JSON-RPC. Retries on transient errors."""
+    arguments: dict = {"content": content}
+    if sources:
+        arguments["sources"] = sources
     for attempt in range(max_retries):
         try:
             r = requests.post(
@@ -250,7 +254,7 @@ def capture_thought(content: str, access_key: str, org_url: str, max_retries: in
                     "method": "tools/call",
                     "params": {
                         "name": "capture_thought",
-                        "arguments": {"content": content},
+                        "arguments": arguments,
                     },
                     "id": 1,
                 },
@@ -322,6 +326,8 @@ def main():
         p = Path(input_path)
         if p.is_dir():
             notes = discover_notes(p, excludes, args.min_chars)
+            for n in notes:
+                n["vault"] = p.name
             print(f"Found {len(notes)} notes in {p}")
             all_notes.extend(notes)
         elif p.is_file():
@@ -331,6 +337,7 @@ def main():
             note = load_single_note(p, args.min_chars)
             if note is None:
                 sys.exit(1)
+            note["vault"] = p.parent.name
             print(f"Loaded single file: {p}")
             all_notes.append(note)
         else:
@@ -410,7 +417,19 @@ def main():
                         continue
                     item = edited
 
-            if capture_thought(item, access_key, org_url):
+            extra: dict = {
+                "path_at_import": note["path"],
+                "imported_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if note.get("vault"):
+                extra["vault"] = note["vault"]
+            sources = [{
+                "system": "obsidian",
+                "locator": f"[[{note['title']}]]",
+                "label": note["title"],
+                "extra": extra,
+            }]
+            if capture_thought(item, access_key, org_url, sources=sources):
                 total_saved += 1
                 print(f"  ✓ Saved")
             else:

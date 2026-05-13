@@ -323,19 +323,33 @@ server.registerTool(
       "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
     inputSchema: {
       content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      sources: z
+        .array(
+          z.object({
+            system: z.string().min(1).describe("Source system identifier (e.g., 'obsidian', 'web', 'gmail', 'slack')"),
+            locator: z.string().min(1).describe("Unique identifier within the source system (file path, URL, message id, etc.)"),
+            label: z.string().optional().describe("Optional human-readable label"),
+            extra: z.record(z.unknown()).optional().describe("Optional system-specific metadata"),
+          }),
+        )
+        .optional()
+        .describe("Optional origins this thought derives from. Each entry is uniquely identified by (system, locator)."),
     },
   },
-  async ({ content }) => {
+  async ({ content, sources }) => {
     try {
       const [embedding, metadata] = await Promise.all([
         getEmbedding(content),
         extractMetadata(content),
       ]);
 
+      const finalMetadata: Record<string, unknown> = { ...metadata, source: "mcp" };
+      if (sources && sources.length > 0) finalMetadata.sources = sources;
+
       const { error } = await supabase.from("thoughts").insert({
         content,
         embedding,
-        metadata: { ...metadata, source: "mcp" },
+        metadata: finalMetadata,
       });
 
       if (error) {
@@ -353,6 +367,8 @@ server.registerTool(
         confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
       if (Array.isArray(meta.action_items) && meta.action_items.length)
         confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+      if (sources && sources.length > 0)
+        confirmation += ` | Sources: ${sources.map((s) => `${s.system}:${s.locator}`).join(", ")}`;
 
       return {
         content: [{ type: "text" as const, text: confirmation }],
