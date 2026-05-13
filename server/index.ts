@@ -135,6 +135,12 @@ server.registerTool(
             parts.push(`People: ${(m.people as string[]).join(", ")}`);
           if (Array.isArray(m.action_items) && m.action_items.length)
             parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
+          if (Array.isArray(m.sources) && m.sources.length)
+            parts.push(
+              `Sources: ${(m.sources as Array<{ system: string; locator: string }>)
+                .map((s) => `${s.system}:${s.locator}`)
+                .join(", ")}`,
+            );
           parts.push(`\n${t.content}`);
           return parts.join("\n");
         }
@@ -222,7 +228,13 @@ server.registerTool(
           const m = t.metadata || {};
           const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
           const flagMark = t.to_be_deleted ? " [FLAGGED]" : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] id=${t.id}${flagMark} (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+          const srcs =
+            Array.isArray(m.sources) && m.sources.length
+              ? `\n   Sources: ${(m.sources as Array<{ system: string; locator: string }>)
+                  .map((s) => `${s.system}:${s.locator}`)
+                  .join(", ")}`
+              : "";
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] id=${t.id}${flagMark} (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}${srcs}`;
         }
       );
 
