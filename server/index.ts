@@ -22,6 +22,7 @@ async function getEmbedding(text: string): Promise<number[]> {
     body: JSON.stringify({
       model: OLLAMA_EMBED_MODEL,
       input: text,
+      keep_alive: "24h",
     }),
   });
   if (!r.ok) {
@@ -40,6 +41,7 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       model: OLLAMA_CHAT_MODEL,
       format: "json",
       stream: false,
+      keep_alive: "24h",
       messages: [
         {
           role: "system",
@@ -341,7 +343,7 @@ server.registerTool(
             system: z.string().min(1).describe("Source system identifier (e.g., 'obsidian', 'web', 'gmail', 'slack')"),
             locator: z.string().min(1).describe("Unique identifier within the source system (file path, URL, message id, etc.)"),
             label: z.string().optional().describe("Optional human-readable label"),
-            extra: z.record(z.unknown()).optional().describe("Optional system-specific metadata"),
+            extra: z.record(z.string(), z.unknown()).optional().describe("Optional system-specific metadata"),
           }),
         )
         .optional()
