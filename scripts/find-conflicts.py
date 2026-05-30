@@ -68,6 +68,9 @@ def call_find_all_conflicts(
             timeout=600,
         )
         r.raise_for_status()
+        # Force UTF-8: text/event-stream without an explicit charset parameter
+        # defaults to ISO-8859-1 per RFC 2046, which mangles smart typography.
+        r.encoding = "utf-8"
 
         for line in r.text.splitlines():
             if not line.startswith("data: "):

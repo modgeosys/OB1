@@ -300,6 +300,10 @@ def capture_thought(content: str, access_key: str, org_url: str, sources: list[d
                 timeout=120,
             )
             r.raise_for_status()
+            # Force UTF-8: the Edge Function returns text/event-stream without an
+            # explicit charset parameter, so requests defaults to ISO-8859-1 (per
+            # RFC 2046) and mangles smart typography into 3-codepoint mojibake.
+            r.encoding = "utf-8"
             # Parse SSE response
             for line in r.text.splitlines():
                 if line.startswith("data: "):

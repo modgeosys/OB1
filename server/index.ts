@@ -692,6 +692,21 @@ const corsHeaders = {
 
 const app = new Hono();
 
+// Ensure text/event-stream responses declare UTF-8. Without an explicit charset
+// parameter, RFC 2046 says text/* defaults to ISO-8859-1, and strict clients
+// (notably Python's requests library) decode the SSE body that way — mangling
+// any non-ASCII typography into 3-codepoint mojibake. Browsers default SSE to
+// UTF-8 per the EventSource spec, so this only bites HTTP-library clients.
+app.use("*", async (c, next) => {
+  await next();
+  const ct = c.res.headers.get("Content-Type");
+  if (ct && ct.toLowerCase().startsWith("text/event-stream") && !ct.toLowerCase().includes("charset")) {
+    const headers = new Headers(c.res.headers);
+    headers.set("Content-Type", "text/event-stream; charset=utf-8");
+    c.res = new Response(c.res.body, { status: c.res.status, headers });
+  }
+});
+
 // CORS preflight — required for browser/Electron-based clients (Claude Desktop, claude.ai)
 app.options("*", (c) => {
   return c.text("ok", 200, corsHeaders);

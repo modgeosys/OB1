@@ -15,3 +15,6 @@ sync-log.json
 # Build artifacts
 deno.lock
 scripts/__pycache__/
+
+# find-conflicts.py output reports
+conflicts-*.json
