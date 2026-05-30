@@ -133,8 +133,11 @@ def build_chunks(note: dict, max_chars: int = MAX_TRANSCRIPT_CHARS) -> list[str]
     title = note["title"]
     body = note["body"]
 
-    # Reserve space for the header and a small safety margin
-    header_template = f"Note: {title} (part {{n}}/{{total}})\n\n"
+    # Chunk markers are processing metadata, not part of the note content. The
+    # explicit framing keeps the model from extracting "part N/M" or "12-part series"
+    # as if the document itself were structured that way.
+    chunk_marker = "[Processing metadata — IGNORE for extraction: this is segment {n} of {total} from a single document; treat the content below as one segment of a larger note.]"
+    header_template = f"Note: {title}\n{chunk_marker}\n\n"
     single_header = f"Note: {title}\n\n"
     budget = max_chars - len(header_template.format(n=99, total=99)) - 100
 
@@ -180,17 +183,16 @@ def build_chunks(note: dict, max_chars: int = MAX_TRANSCRIPT_CHARS) -> list[str]
 
     flush()
 
-    # Prepend headers with part numbers
+    # Prepend headers with chunk metadata
     total = len(raw_chunks)
-    return [f"Note: {title} (part {n + 1}/{total})\n\n{c}" for n, c in enumerate(raw_chunks)]
+    return [
+        f"Note: {title}\n{chunk_marker.format(n=n + 1, total=total)}\n\n{c}"
+        for n, c in enumerate(raw_chunks)
+    ]
 
 
-def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL, timeout: int = OLLAMA_TIMEOUT, max_retries: int = 3) -> list[str]:
-    """Send transcript to Ollama and extract persistent knowledge items.
-
-    Retries on network errors (exponential backoff) and on malformed JSON from
-    the model (immediate retry — re-sampling usually produces valid JSON).
-    """
+def _extract_attempt(transcript: str, prompt: str, model: str, timeout: int, max_retries: int, seed: int) -> list[str]:
+    """One pass of extraction at a given seed. Retries on transient/network/JSON errors."""
     for attempt in range(max_retries):
         try:
             r = requests.post(
@@ -199,6 +201,7 @@ def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL, t
                     "model": model,
                     "format": "json",
                     "stream": False,
+                    "options": {"temperature": 0, "seed": seed},
                     "messages": [
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": transcript},
@@ -210,14 +213,20 @@ def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL, t
             content = r.json()["message"]["content"]
             parsed = json.loads(content)
 
-            # Handle both array and object-with-array responses
+            # Models return one of three shapes; we handle all of them so a
+            # well-formed extraction isn't silently dropped on the floor.
             if isinstance(parsed, list):
                 return [str(item) for item in parsed if item]
             if isinstance(parsed, dict):
-                # Some models wrap the array in a key
+                # Shape 1: array wrapped under a key, e.g. {"statements": [...]}
                 for value in parsed.values():
                     if isinstance(value, list):
                         return [str(item) for item in value if item]
+                # Shape 2: flat dict of {key: statement}, e.g. {"philosophy_holism": "..."}
+                string_values = [str(v).strip() for v in parsed.values() if isinstance(v, str) and v.strip()]
+                if string_values:
+                    return string_values
+            print(f"  ⚠ Unexpected response shape (no statements extracted): {type(parsed).__name__} — content head: {str(parsed)[:200]}", file=sys.stderr)
             return []
         except json.JSONDecodeError as e:
             if attempt < max_retries - 1:
@@ -238,6 +247,32 @@ def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL, t
             return []
 
     return []
+
+
+def extract_knowledge(transcript: str, prompt: str, model: str = OLLAMA_MODEL, timeout: int = OLLAMA_TIMEOUT, max_retries: int = 3) -> list[str]:
+    """Extract persistent knowledge from a transcript.
+
+    First pass is fully deterministic (temperature=0, fixed seed) so runs are
+    reproducible. If a substantive chunk returns suspiciously few items, the
+    model has likely mis-classified real content as scaffolding — resample once
+    with a different seed and keep the richer result.
+    """
+    primary = _extract_attempt(transcript, prompt, model, timeout, max_retries, seed=42)
+
+    body_chars = len(transcript)
+    if body_chars > 1500:
+        # Roughly one usable statement per ~800 chars, capped at 4
+        expected_min = min(4, max(1, body_chars // 800))
+        if len(primary) < expected_min:
+            print(
+                f"  ⓘ Thin result ({len(primary)} items from {body_chars} chars, "
+                f"expected ≥ {expected_min}); resampling with new seed",
+                file=sys.stderr,
+            )
+            retry = _extract_attempt(transcript, prompt, model, timeout, max_retries, seed=43)
+            if len(retry) > len(primary):
+                return retry
+    return primary
 
 
 def capture_thought(content: str, access_key: str, org_url: str, sources: list[dict] | None = None, max_retries: int = 3) -> bool:
